@@ -1,0 +1,25 @@
+# binário
+dub
+
+# logs de run
+run*.log
+
+# dados intermediários e saída
+work/
+work_*/
+out/
+
+# mídia grande (episódios, fatias, áudio) — não versionar
+*.mkv
+*.wav
+*.mp3
+*.flac
+testdata/makeine_slice.mp4
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# go
+*.test

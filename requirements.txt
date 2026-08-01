@@ -1,0 +1,23 @@
+# anime_dub — dependências do venv (CPU only)
+# As camadas Python são APENAS wrappers finos em volta de modelos ML.
+# Toda orquestração/lógica está em Go (dub.go).
+
+# ── Base ──────────────────────────────────────────────────────────
+numpy>=1.26
+scipy>=1.11
+soundfile>=0.12
+pydub>=0.25
+
+# ── TTS (motor do aiuto_trend_producer: OmniVoice k2-fsa) ─────────
+omnivoice
+
+# ── ASR (transcrição do japonês + timestamps de palavra) ─────────
+faster-whisper>=1.0
+
+# ── Separação voz × fundo (limpeza de fundo p/ fluxo melhor) ─────
+demucs>=1.0
+
+# ── Util para embeds de voz / heurísticas (opcional) ─────────────
+librosa>=0.10
+scikit-learn>=1.4
+speechbrain>=1.0        # embeddings ECAPA p/ diarização (fallback: MFCC do librosa)
