@@ -44,6 +44,11 @@ func (o *Options) defaults() {
 	if o.Out == "" {
 		o.Out = "out/final.mkv"
 	}
+	// --out pode vir como diretório (ex.: "out/"): vira out/final.mkv
+	if st, err := os.Stat(o.Out); err == nil && st.IsDir() ||
+		strings.HasSuffix(o.Out, "/") || strings.HasSuffix(o.Out, string(filepath.Separator)) {
+		o.Out = filepath.Join(o.Out, "final.mkv")
+	}
 	if o.Work == "" {
 		o.Work = "work"
 	}
