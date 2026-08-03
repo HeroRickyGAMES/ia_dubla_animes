@@ -28,7 +28,9 @@ type Options struct {
 	Separator  string // demucs|none
 	FixRoles   bool
 	StretchMax float64
+	TtsSpeed   float64
 	FastASR    bool
+	Overlap    bool // separa falas com 2 vozes simultâneas (SepFormer)
 	Script     string
 	Roles      string
 	MaxLines   int
@@ -134,6 +136,7 @@ type Line struct {
 	DubLen  float64 `json:"-"`
 	Place   float64 `json:"-"`
 	Atempo  float64 `json:"-"`
+	PlayLen float64 `json:"-"`
 	Flags   []string `json:"-"`
 }
 

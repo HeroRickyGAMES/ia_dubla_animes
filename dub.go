@@ -35,9 +35,11 @@ Flags de 'dub':
       --lang CODE       idioma original ja|en|... → dubla para pt (default: ja)
       --sep MODE        demucs|none  — separação voz×fundo (default: demucs)
       --fast-asr        roda ASR sobre o áudio original em paralelo com o demucs
+      --overlap=false   NÃO separar falas com 2 vozes simultâneas (SepFormer; default on)
       --script FILE     roteiro com falantes (SRT/ASS/JSON) p/ validar voz×papel
       --roles "a:menino,b:menina"   papel esperado por personagem
-      --stretch-max F   acelerar a fala até F (ex: 0.1=10%) se não couber (default 0)
+      --stretch-max F   acelerar a fala até F se não couber na janela (default 0.15)
+      --tts-speed F     falar mais rápido no OmniVoice (ex: 1.1; 0 = natural)
       --max-lines N     limita o nº de falas (testes rápidos)
       --force           refaz estágios já cacheados
       --threads N       threads de CPU (default: 12)
@@ -81,9 +83,11 @@ func main() {
 		fs.StringVar(&opts.Lang, "lang", "ja", "idioma original (ja|en|...), dubla para pt")
 		fs.StringVar(&opts.Separator, "sep", "demucs", "demucs|none")
 		fs.BoolVar(&opts.FastASR, "fast-asr", false, "ASR paralelo sobre o original")
+		fs.BoolVar(&opts.Overlap, "overlap", true, "separar falas com 2 vozes (SepFormer)")
 		fs.StringVar(&opts.Script, "script", "", "roteiro p/ validar voz×papel")
 		fs.StringVar(&opts.Roles, "roles", "", "papel esperado por personagem")
-		fs.Float64Var(&opts.StretchMax, "stretch-max", 0, "acelerar até X se preciso")
+		fs.Float64Var(&opts.StretchMax, "stretch-max", 0.15, "acelerar até X se não couber")
+		fs.Float64Var(&opts.TtsSpeed, "tts-speed", 0, "falar mais rápido no OmniVoice (ex: 1.1; 0 = natural")
 		fs.IntVar(&opts.MaxLines, "max-lines", 0, "limita falas")
 		fs.BoolVar(&opts.Force, "force", false, "refaz estágios cacheados")
 		fs.IntVar(&opts.Threads, "threads", 12, "threads CPU")

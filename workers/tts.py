@@ -26,6 +26,72 @@ import time
 
 SAMPLE_RATE = 24000
 
+# OmniVoice tem um artefato de "aquecimento" no início de quase toda fala:
+# uma sílaba curta vocalizada (ouvida como "u/at/pat/vamos/ah") seguida de
+# um silêncio antes da palavra real. Padrão típico: 1ª ilha sonora ≤ 0.6s +
+# vão ≥ 0.25s até a próxima ilha. Removemos isso sem tocar na fala real.
+ARTIFACT_MAX_FIRST = 0.6   # 1ª ilha acima disso não é artefato
+ARTIFACT_MIN_GAP = 0.25    # vão mínimo antes da fala real
+TAIL_MAX_LAST = 0.5        # cauda "resmungada" menor que isso é removida
+TAIL_MIN_GAP = 0.4         # se vier depois de um silêncio desse tamanho
+
+
+def _sound_islands(seg):
+    """Ilhas sonoras (agrupadas por RMS) do AudioSegment, em segundos."""
+    import numpy as np
+    samples = np.frombuffer(seg.raw_data, dtype=np.int16).astype(np.float32) / 32768.0
+    sr = seg.frame_rate
+    ws = int(sr * 0.010)
+    n = len(samples) // ws
+    if n < 4:
+        return []
+    frames = samples[: n * ws].reshape(n, ws)
+    rms = np.sqrt(np.mean(frames ** 2, axis=1))
+    thr = max(rms.max() * 0.02, 0.0008)
+    on = rms > thr
+    out = []
+    i = 0
+    while i < n:
+        if on[i]:
+            j = i
+            while j < n and on[j]:
+                j += 1
+            out.append((i * ws / sr, j * ws / sr))
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def _strip_leading_artifact(seg):
+    """Remove o 'u/at' inicial (artefato do modelo) antes da fala real."""
+    iso = _sound_islands(seg)
+    if len(iso) < 2:
+        return seg
+    f0, f1 = iso[0]
+    s0, _ = iso[1]
+    if (f1 - f0) <= ARTIFACT_MAX_FIRST and (s0 - f1) >= ARTIFACT_MIN_GAP:
+        cut_ms = int((s0 - 0.03) * 1000)  # mantém 30ms de respiro
+        total_ms = len(seg)
+        if 0 < cut_ms < total_ms * 0.5:
+            return seg[cut_ms:]
+    return seg
+
+
+def _strip_tail_junk(seg):
+    """Remove uma cauda curta e isolada (resmungo final do modelo)."""
+    iso = _sound_islands(seg)
+    if len(iso) < 2:
+        return seg
+    p0, p1 = iso[-2]
+    l0, l1 = iso[-1]
+    if (l1 - l0) <= TAIL_MAX_LAST and (l0 - p1) >= TAIL_MIN_GAP:
+        keep_ms = int(p1 * 1000) + 30
+        total_ms = len(seg)
+        if 0 < keep_ms < total_ms:
+            return seg[:keep_ms]
+    return seg
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -35,6 +101,8 @@ def main():
     ap.add_argument("--engine", required=True,
                     help="pasta do aiuto_trend_producer (motor OmniVoice)")
     ap.add_argument("--max-lines", type=int, default=0, help="0 = todas")
+    ap.add_argument("--speed", type=float, default=1.0,
+                    help="fator de velocidade no OmniVoice (1.0 = natural)")
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.join(args.engine, "modules"))
@@ -115,44 +183,57 @@ def main():
 
         t0 = time.time()
         out_path = os.path.join(args.out, f"{line_id:05d}.wav")
-        try:
-            emo = emotions.get(str(line_id), {})
-            if emo.get("emotion") in EMO_TAGS and emo.get("conf", 0) >= 0.4:
-                text = EMO_TAGS[emo["emotion"]] + text
-            sentences = engine_ov._dividir_em_sentencas(text)
-            parts = []
-            for sent in sentences:
-                kwargs = {"text": sent, "language": "pt"}
-                p = prompts.get(spk)
-                if p is not None:
-                    kwargs["voice_clone_prompt"] = p
-                else:
-                    info = speakers.get(spk, {})
-                    if info.get("ref_audio"):
-                        kwargs["ref_audio"] = info["ref_audio"]
-                        if info.get("ref_text"):
-                            kwargs["ref_text"] = info["ref_text"]
-                audio = model.generate(**kwargs)
-                arr = np.asarray(audio[0], dtype=np.float32)
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    sf.write(tmp.name, arr, SAMPLE_RATE)
-                    seg = AudioSegment.from_wav(tmp.name)
-                seg = engine_xtts._strip_silence(seg)
-                seg = seg.fade_in(8).fade_out(12)
-                parts.append((sent, seg))
-                os.unlink(tmp.name)
+        last_err = None
+        for attempt in range(3):
+            try:
+                emo = emotions.get(str(line_id), {})
+                if emo.get("emotion") in EMO_TAGS and emo.get("conf", 0) >= 0.4:
+                    text = EMO_TAGS[emo["emotion"]] + text
+                sentences = engine_ov._dividir_em_sentencas(text)
+                parts = []
+                for sent in sentences:
+                    kwargs = {"text": sent, "language": "pt",
+                              "speed": args.speed if args.speed and args.speed > 0 else None}
+                    p = prompts.get(spk)
+                    if p is not None:
+                        kwargs["voice_clone_prompt"] = p
+                    else:
+                        info = speakers.get(spk, {})
+                        if info.get("ref_audio"):
+                            kwargs["ref_audio"] = info["ref_audio"]
+                            if info.get("ref_text"):
+                                kwargs["ref_text"] = info["ref_text"]
+                    audio = model.generate(**kwargs)
+                    arr = np.asarray(audio[0], dtype=np.float32)
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                        sf.write(tmp.name, arr, SAMPLE_RATE)
+                        seg = AudioSegment.from_wav(tmp.name)
+                    seg = engine_xtts._strip_silence(seg)
+                    seg = _strip_leading_artifact(seg)
+                    seg = _strip_tail_junk(seg)
+                    seg = seg.fade_in(8).fade_out(12)
+                    parts.append((sent, seg))
+                    os.unlink(tmp.name)
 
-            final = AudioSegment.empty()
-            for j, (sent, seg) in enumerate(parts):
-                final += seg
-                if j < len(parts) - 1:
-                    final += engine_ov._pausa_por_pontuacao(sent)
+                final = AudioSegment.empty()
+                for j, (sent, seg) in enumerate(parts):
+                    final += seg
+                    if j < len(parts) - 1:
+                        final += engine_ov._pausa_por_pontuacao(sent)
 
-            final = engine_ov._pos_processar(final)
-            final.export(out_path, format="wav")
-            n_ok += 1
-        except Exception as e:
-            print(f"[tts] ERRO fala {line_id}: {e}")
+                final = engine_ov._pos_processar(final)
+                final.export(out_path, format="wav")
+                n_ok += 1
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    print(f"[tts] fala {line_id} tentativa {attempt+1} falhou: {e}")
+                    time.sleep(2)
+        else:
+            print(f"[tts] ERRO fala {line_id}: {last_err}")
+            with open(os.path.join(args.work, "tts_errors.log"), "a") as ef:
+                ef.write(f"{line_id}: {last_err}\n")
             n_err += 1
         times[str(line_id)] = round(time.time() - t0, 3)
 

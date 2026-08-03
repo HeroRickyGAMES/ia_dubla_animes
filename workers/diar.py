@@ -80,7 +80,7 @@ def main():
             )
         return emb.squeeze().numpy()
 
-    method = "mfcc"
+    method = "ecapa" if use_ecapa else "mfcc"
     vecs, ids = [], []
     for s in segs:
         if use_ecapa:
@@ -89,6 +89,7 @@ def main():
             except Exception as exc:
                 print(f"[diar] ECAPA falhou em runtime ({exc}); usando MFCC")
                 use_ecapa = False
+                method = "mfcc"
                 vecs, ids = [], []
         if not use_ecapa:
             e = embed_mfcc(slice_seg(s))

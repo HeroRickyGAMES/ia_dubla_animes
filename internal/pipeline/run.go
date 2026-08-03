@@ -100,6 +100,17 @@ func (o *Options) Run(ctx context.Context) error {
 	}
 	r.Add("sep+asr", st.Elapsed())
 
+	// ═══ 2b. separação de vozes sobrepostas (SepFormer) ═══
+	st = report.Begin()
+	overlapSrc := vocalsRaw
+	if _, err := os.Stat(overlapSrc); err != nil {
+		overlapSrc = vocals
+	}
+	if err := o.stageOverlap(ctx, overlapSrc); err != nil {
+		o.logf("[overlap] falhou, mantendo segmentos originais: %v", err)
+	}
+	r.Add("overlap", st.Elapsed())
+
 	// ═══ 3. diarização ═══
 	st = report.Begin()
 	if err := o.stageDiar(ctx); err != nil {
@@ -199,6 +210,92 @@ func (o *Options) stageASR(ctx context.Context, audio string) error {
 		"--lang", o.Lang,
 		"--model", o.Whisper,
 		"--out", out)
+}
+
+// stageOverlap separa segmentos com 2 vozes simultâneas (SepFormer).
+// Substitui em asr.json os segmentos mistos pelas falas de cada voz.
+type overlapSplit struct {
+	OrigID int       `json:"orig_id"`
+	Parts  []Segment `json:"parts"`
+}
+type overlapResult struct {
+	Splits []overlapSplit `json:"splits"`
+}
+
+func (o *Options) stageOverlap(ctx context.Context, audio string) error {
+	out := filepath.Join(o.Work, "overlap.json")
+	if !cached(out, o.Force) {
+		if !o.Overlap {
+			return writeJSON(out, overlapResult{})
+		}
+		o.logf("[overlap] procurando falas com 2 vozes simultâneas (SepFormer)...")
+		if err := o.runPy("workers/overlap.py",
+			"--audio", audio,
+			"--segments", filepath.Join(o.Work, "asr.json"),
+			"--out", out,
+			"--model", o.Whisper,
+			"--lang", o.Lang); err != nil {
+			return err
+		}
+	}
+	ov, err := readJSON[overlapResult](out)
+	if err != nil {
+		return err
+	}
+	if len(ov.Splits) == 0 {
+		return nil
+	}
+
+	asrPath := filepath.Join(o.Work, "asr.json")
+	asr, err := readJSON[ASR](asrPath)
+	if err != nil {
+		return err
+	}
+	// idempotência: só aplica o split se o segmento original ainda existir
+	existing := map[int]bool{}
+	for _, s := range asr.Segments {
+		existing[s.ID] = true
+	}
+	drop := map[int]bool{}
+	var add []Segment
+	changed := false
+	for _, sp := range ov.Splits {
+		if !existing[sp.OrigID] {
+			continue // já aplicado em execução anterior
+		}
+		changed = true
+		drop[sp.OrigID] = true
+		add = append(add, sp.Parts...)
+	}
+	if !changed {
+		return nil
+	}
+	keep := make([]Segment, 0, len(asr.Segments))
+	for _, s := range asr.Segments {
+		if drop[s.ID] {
+			continue
+		}
+		keep = append(keep, s)
+	}
+	asr.Segments = append(keep, add...)
+	sort.SliceStable(asr.Segments, func(i, j int) bool {
+		return asr.Segments[i].Start < asr.Segments[j].Start
+	})
+	if err := writeJSON(asrPath, asr); err != nil {
+		return err
+	}
+
+	// estágios derivados ficam inválidos com os novos segmentos
+	for _, p := range []string{"diar.json", "emotion.json", "lines.json", "tts_times.json"} {
+		os.Remove(filepath.Join(o.Work, p))
+	}
+	os.RemoveAll(filepath.Join(o.Work, "refs"))
+	os.RemoveAll(filepath.Join(o.Work, "dubs"))
+	os.MkdirAll(filepath.Join(o.Work, "refs"), 0o755)
+	os.MkdirAll(filepath.Join(o.Work, "dubs"), 0o755)
+	o.logf("[overlap] %d segmento(s) mistos divididos em %d falas",
+		len(ov.Splits), len(add))
+	return nil
 }
 
 // stageDiar agrupa falas por personagem (clusters).
@@ -531,13 +628,24 @@ func (o *Options) stageTTS(lines []Line, spkMap map[string]*Speaker) error {
 		return nil
 	}
 	o.logf("[tts] gerando %d falas dubladas (OmniVoice, cpu)...", len(lines))
-	if err := o.runPy("workers/tts.py",
+	ttsArgs := []string{
+		"workers/tts.py",
 		"--lines", linesJSON,
 		"--out", filepath.Join(o.Work, "dubs"),
 		"--work", o.Work,
 		"--engine", o.Engine,
-		"--max-lines", strconv.Itoa(o.MaxLines)); err != nil {
+		"--max-lines", strconv.Itoa(o.MaxLines),
+	}
+	if o.TtsSpeed > 0 {
+		ttsArgs = append(ttsArgs, "--speed", strconv.FormatFloat(o.TtsSpeed, 'f', 3, 64))
+	}
+	if err := o.runPy(ttsArgs...); err != nil {
 		return err
+	}
+	tt, err := readJSON[ttsTimes](filepath.Join(o.Work, "tts_times.json"))
+	if err == nil && tt.NErr > 0 {
+		return fmt.Errorf("tts: %d fala(s) falharam — log: %s",
+			tt.NErr, filepath.Join(o.Work, "tts_errors.log"))
 	}
 	for i := range lines {
 		lines[i].DubFile = filepath.Join(o.Work, "dubs", fmt.Sprintf("%05d.wav", lines[i].ID))
@@ -565,6 +673,7 @@ func (o *Options) stageMix(ctx context.Context, dur float64, lines []Line) error
 	for i := range lines {
 		lines[i].Place = planned[i].Place
 		lines[i].Atempo = planned[i].Atempo
+		lines[i].PlayLen = planned[i].PlayLen
 		lines[i].Flags = planned[i].Flags
 	}
 
@@ -605,4 +714,11 @@ func overlap(a0, a1, b0, b1 float64) float64 {
 		return 0
 	}
 	return hi - lo
+}
+
+type ttsTimes struct {
+	TotalMS int                `json:"total_ms"`
+	PerLine map[string]float64 `json:"per_line_ms"`
+	NOk     int                `json:"n_ok"`
+	NErr    int                `json:"n_err"`
 }

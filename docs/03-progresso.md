@@ -185,3 +185,52 @@ para saber o que já foi feito e o que falta.
   - "Dublado pela metade": esperado do teste — `--max-lines 20` dublou só
     20 das 58 falas da fatia (além de 9 `long`/9 `shifted` no timeline).
     Para run completo, subir `--max-lines` ou rodar a fatia inteira.
+
+## 2026-08-02 — Run completo YameiiS01E01 EN→PT (E2E 100%)
+
+### Descobertas
+- **O episódio é inglês** (auto-detect en 0.88–0.99 em várias amostras);
+  `--lang ja` força ALUCINAÇÃO de kanji/kana (213/230 segs com kana).
+  Rodar SEMPRE com `--lang en` para este arquivo. A dublagem é EN→PT.
+- `work/vocals.wav` (demucs) sai em **44.1 kHz**, não 16k: SepFormer e
+  slices assumindo 16k precisam de resample (librosa → target_sr=16000).
+
+### Overlap (2 vozes simultâneas) — sep.py e overlap.py
+- **BUG do shape**: `separate_batch` retorna `(1, samples, 2)`; o unpack
+  criava 184k stems. Fix em `workers/overlap.py`: `est = est[0]` e, se
+  `(samples, 2)`, transpor → `(2, samples)`.
+- **128 falso-splits**: sem filtro, o SepFormer dividia até fala única
+  (stem2 = eco/resíduo re-transcrito). Fix: `--min-energy-ratio 0.25`
+  (voz fraca ≥25% da energia da forte) + `--max-sim 0.5` (difflib
+  SequenceMatcher entre os textos). Resultado: **18 splits reais** (36
+  falas; ex. seg 58 e 96 viram 2 falas com textos distintos de fato).
+- `stageOverlap` (Go) NÃO aplicava os splits quando `overlap.json` já
+  existia (cache). Fix: aplicar sempre, e torná-lo **idempotente** (só
+  reaplica se o segmento original ainda existir no asr.json).
+
+### Diarização ECAPA
+- `workers/diar.py` gravava `"method":"mfcc"` mesmo com ECAPA (label fixo).
+  Fix: `"ecapa" se use_ecapa senão "mfcc"`. ECAPA validado standalone
+  (192-dim, norms 264–355); 5 clusters no E2E.
+
+### Bugs corrigidos
+- **refs vazios (crítico)**: `stageOverlap` fazia `RemoveAll(work/refs)` e
+  `RemoveAll(work/dubs)` ao invalidar estágios derivados, mas os diretórios
+  só eram criados no início do `Run()` → `refs/` não existia quando
+  `stageSpeakers` slicava → TODOS os speakers "sem trechos de voz" → TTS
+  usava voz padrão (sem clone) silenciosamente. Fix: recriar `refs/` e
+  `dubs/` logo após a remoção (run.go).
+- **TTS fala 46 falhou 1x em 341** (transiente, funciona isolada) sem ser
+  visível: o stdout do worker só era logado com `-v`. Fix em `workers/tts.py`:
+  retry 3x por fala + erros gravados em `work/tts_errors.log`; e
+  `stageTTS` agora falha se `tts_times.json` reportar `n_err > 0` (não
+  deixa o mix rodar com dub faltando).
+
+### E2E completo (17:08–21:08, ~4 h)
+- `./dub dub -i YameiiS01E01.mkv -o YameiiS01E01.dub.mkv --lang en`
+- 347 segmentos ASR (329 + 18 splits×2 − originais), 341 falas dubladas,
+  5 personagens com clone de voz (refs + prompts .pt cacheados).
+- TTS: 341/341 OK (~3.7 h, ~39 s/fala com clone); mix 16 min; total ~4 h.
+- Saída: `YameiiS01E01.dub.mkv` (1.47 GB, 1440 s, h264 + aac 96 kHz,
+  loudnorm -14 LUFS). Dados em docs/04-resultados.md.
+- Flags timeline: 233 long / 36 stretched / 103 clipped (ver timeline.go).
