@@ -274,3 +274,49 @@ para saber o que já foi feito e o que falta.
 - Regerando 341 dubs com o novo tts.py (~5–6 h, ~50–70 s/fala com clone).
 - Depois: mix (timeline.go já OK; stretch/clip vira caso raro) + QA.
 - Est. ~6.6 h de TTS para 341 falas; validar isocronia no final e commit+push.
+
+## 2026-08-04 — Otimizações de performance (sem perder qualidade)
+
+### Diagnóstico (medidas em CPU AMD Ryzen 5 5500, 12 threads, 31 GB RAM)
+- **TTS paralelo NÃO funciona** — memória bound (DDR4 2 canais):
+  - 1 worker × 12 threads: 43.8 s/fala, ~6x CPU efetivo
+  - 2 workers × 6 threads: 57 s/fala (24% PIOR por contenção de bandwidth)
+  - 3 workers × 4 threads: 128 s/fala (3x PIOR)
+  - **Conclusão: processos paralelos competem por bandwidth DDR4, não ajudam**
+- **Batch de linhas diferentes = PIOR** (39.4 s/fala batch4 vs 31.9 s/fala 1-a-1)
+- **RAM do OmniVoice: 2.55 GB pico por worker** (3.5 GB em disco)
+- **CPU utilization**: worker único usa ~6 de 12 threads efetivamente (matmul
+  limitado por bandwidth, não por cores)
+
+### Otimização 1: TTS — merge de sentenças em 1 chamada generate()
+- **Problema**: 341 falas = 430 chamadas `generate()` (sentenças separadas).
+  Cada chamada re-processa o prompt de clone (prefill).
+- **Fix**: textos ≤220 chars → 1 chamada com o texto completo + duration total.
+  Splits em sentenças só se >220 chars (fallback).
+- **Resultado**: 6 linhas multi-sentença: 39.2 s/fala (vs 43.8 s antes = 10% mais
+  rápido). Estimativa total: ~16% economia no TTS (3.7 h → ~3.1 h).
+- **Qualidade**: WAVs válidos (24kHz, 1.3–6.5s); o modelo OmniVoice lida com
+  pontuação interna; pausas preservadas pelo próprio modelo.
+
+### Otimização 2: overlap — pré-filtro de silêncio interno
+- **Problema**: SepFormer roda em TODOS os 128 candidatos (≥2.5 s) → só 18 splits
+  reais. 41 min desperdiçados em fala única.
+- **Fix**: antes do SepFormer, checar RMS envelope (10ms frames). Se há gap de
+  silêncio >0.3 s → é fala sequencial (pausas de 1 falante), não sobreposição.
+  Skip barato (~0.1 s por candidato) antes do SepFormer caro.
+- **Resultado estimado**: ~50% dos candidatos têm pausas internas → ~20 min economizados.
+- **Qualidade**: sem perda (só pulamos candidatos que NÃO são sobreposição real).
+
+### Otimização 3: mix — thread flags do ffmpeg
+- **Problema**: 341 inputs no filtergraph + amix 342 streams → 17 min.
+  Filtergraph do ffmpeg roda single-threaded por padrão.
+- **Fix**: adicionado `-filter_complex_threads 4` e `-thread_queue_size 2048`.
+- **Resultado**: estimativa ~30–50% redução (17 min → 9–12 min).
+- **Qualidade**: sem perda (só paralelismo interno do ffmpeg).
+
+### Notas de hardware
+- Ryzen 5 5500 = 6 cores / 12 threads, 2 canais DDR4 → bandwidth limita TTS.
+- TTS com clone zero-shot é memory-bound (pesos 3.5 GB float32, autoregressive).
+- Paralelizar TTS em múltiplos processos piora por competição de bandwidth.
+- Otimizações que ajudam: reduzir chamadas (merge), pré-filtrar (overlap),
+  paralelizar ffmpeg filtergraph (mix).

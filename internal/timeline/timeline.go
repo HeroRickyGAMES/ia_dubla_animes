@@ -150,6 +150,8 @@ func MixArgs(video, bg, silence, out string, dur float64, lines []Line, threads 
 		"-map", "0:v", "-map", "[aud]",
 		"-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
 		"-metadata:s:a:0", "language=por",
+		"-filter_complex_threads", "4",
+		"-thread_queue_size", "2048",
 		"-shortest",
 	)
 	if threads > 0 {

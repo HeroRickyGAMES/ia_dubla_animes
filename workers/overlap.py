@@ -110,12 +110,43 @@ def main():
         }
 
     splits = []
+    skipped = 0
     for k, s in enumerate(cand):
         a = int(s["start"] * sr)
         b = int(s["end"] * sr)
         chunk = data[a:b]
         if len(chunk) < sr * args.min_dur:
             continue
+
+        # pré-filtro barato: silêncio interno > 0.3s = fala única
+        # (2 vozes sobrepostas não têm pausas internas claras)
+        ws = int(sr * 0.010)
+        nf = len(chunk) // ws
+        if nf > 10:
+            frames = chunk[:nf * ws].reshape(nf, ws)
+            rms = np.sqrt(np.mean(frames ** 2, axis=1))
+            thr = max(rms.max() * 0.02, 0.0008)
+            on = rms > thr
+            gap_max = 0.0
+            gs = None
+            for fi in range(nf):
+                if not on[fi]:
+                    if gs is None:
+                        gs = fi
+                else:
+                    if gs is not None:
+                        gl = (fi - gs) * ws / sr
+                        if gl > gap_max:
+                            gap_max = gl
+                        gs = None
+            if gs is not None:
+                gl = (nf - gs) * ws / sr
+                if gl > gap_max:
+                    gap_max = gl
+            if gap_max > 0.3:
+                skipped += 1
+                continue
+
         try:
             with torch.no_grad():
                 wav = torch.from_numpy(chunk).unsqueeze(0)
@@ -180,7 +211,8 @@ def main():
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump({"splits": splits}, f, ensure_ascii=False, indent=1)
     print(json.dumps({
-        "candidates": len(cand), "splits": len(splits),
+        "candidates": len(cand), "skipped_silence": skipped,
+        "splits": len(splits),
         "seconds": round(time.time() - t0, 1),
     }))
 

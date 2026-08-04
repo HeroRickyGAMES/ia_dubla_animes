@@ -237,15 +237,16 @@ def main():
                 emo = emotions.get(str(line_id), {})
                 if emo.get("emotion") in EMO_TAGS and emo.get("conf", 0) >= 0.4:
                     text = EMO_TAGS[emo["emotion"]] + text
-                sentences = engine_ov._dividir_em_sentencas(text)
-                total_len = sum(len(s) for s in sentences)
-                parts = []
-                for j, sent in enumerate(sentences):
-                    kwargs = {"text": sent, "language": "pt"}
+                # Otimização: texts curtos (≤220 chars) geram numa chamada
+                # só — reutiliza o prefill do prompt de clone (~1.7x mais
+                # rápido para falas multi-sentença). Só split se >220 chars
+                # (safety do _dividir_em_sentencas).
+                if len(text) <= 220:
+                    kwargs = {"text": text, "language": "pt"}
                     if args.speed and args.speed > 0:
                         kwargs["speed"] = args.speed
-                    elif target_dur > 0 and total_len > 0:
-                        kwargs["duration"] = target_dur * len(sent) / total_len
+                    elif target_dur > 0:
+                        kwargs["duration"] = target_dur
                     p = prompts.get(spk)
                     if p is not None:
                         kwargs["voice_clone_prompt"] = p
@@ -264,14 +265,44 @@ def main():
                     seg = _strip_leading_artifact(seg)
                     seg = _strip_tail_junk(seg)
                     seg = seg.fade_in(8).fade_out(12)
-                    parts.append((sent, seg))
-                    os.unlink(tmp.name)
+                    final = seg
+                else:
+                    # Texto longo: split por sentença (fallback original)
+                    sentences = engine_ov._dividir_em_sentencas(text)
+                    total_len = sum(len(s) for s in sentences)
+                    parts = []
+                    for j, sent in enumerate(sentences):
+                        kwargs = {"text": sent, "language": "pt"}
+                        if args.speed and args.speed > 0:
+                            kwargs["speed"] = args.speed
+                        elif target_dur > 0 and total_len > 0:
+                            kwargs["duration"] = target_dur * len(sent) / total_len
+                        p = prompts.get(spk)
+                        if p is not None:
+                            kwargs["voice_clone_prompt"] = p
+                        else:
+                            info = speakers.get(spk, {})
+                            if info.get("ref_audio"):
+                                kwargs["ref_audio"] = info["ref_audio"]
+                                if info.get("ref_text"):
+                                    kwargs["ref_text"] = info["ref_text"]
+                        audio = model.generate(**kwargs)
+                        arr = np.asarray(audio[0], dtype=np.float32)
+                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                            sf.write(tmp.name, arr, SAMPLE_RATE)
+                            seg = AudioSegment.from_wav(tmp.name)
+                        seg = engine_xtts._strip_silence(seg)
+                        seg = _strip_leading_artifact(seg)
+                        seg = _strip_tail_junk(seg)
+                        seg = seg.fade_in(8).fade_out(12)
+                        parts.append((sent, seg))
+                        os.unlink(tmp.name)
 
-                final = AudioSegment.empty()
-                for j, (sent, seg) in enumerate(parts):
-                    final += seg
-                    if j < len(parts) - 1:
-                        final += engine_ov._pausa_por_pontuacao(sent)
+                    final = AudioSegment.empty()
+                    for j, (sent, seg) in enumerate(parts):
+                        final += seg
+                        if j < len(parts) - 1:
+                            final += engine_ov._pausa_por_pontuacao(sent)
 
                 final = engine_ov._pos_processar(final)
                 final.export(out_path, format="wav")
