@@ -320,3 +320,55 @@ para saber o que já foi feito e o que falta.
 - Paralelizar TTS em múltiplos processos piora por competição de bandwidth.
 - Otimizações que ajudam: reduzir chamadas (merge), pré-filtrar (overlap),
   paralelizar ffmpeg filtergraph (mix).
+
+## 2026-08-04 — Fix de qualidade: vazamento EN do ref_text + artefato "at" (strip guiado por ASR)
+
+### Diagnóstico final do vazamento EN
+- **Mecanismo**: `OmniVoice._combine_text` concatena `ref_text.strip() + " " + text`
+  (omnivoice.py L1701) — conteúdo EN do ref é tokenizado e **ecoado** no áudio PT.
+- **Testes empíricos (1–5)**: ref_text cheio (A) é o que preserva melhor a voz;
+  neutro "Hmm." (B) degrada (garble, perda de conteúdo); ref PT traduzido (D)
+  ecoa o conteúdo do ref; vazio (C) é instável. **Ref_text cheio fica**.
+- **Leak é estocástico**: line 9 vazou "É certo!" na produção mas saiu limpa em
+  regenerações com os mesmos inputs. `class_temperature` sem efeito consistente.
+- **Centroid espectral e gate por idioma não discriminam**: eco curto passa como
+  pt pelo whisper; artefato tem centroid similar a fala real.
+- **Amostra 40 linhas da produção**: 13/40 faltam a 1ª palavra PT (over-cut
+  heurístico real, ex. "entendi"→"Temgi"); leaks EN reais: line 31 ("Say no!"),
+  line 46 ("freak out!"). Artefato "at" em line 25 ("Ed.") e line 60 ("Aia! Aia!"
+  sub-cut, não removido).
+
+### Fix implementado: strip guiado por ASR em workers/tts.py
+- `_strip_leading_artifact_asr(seg, pt_text, whisper)`: transcreve o dub com
+  faster-whisper base (int8, `word_timestamps=True`) e remove tudo antes da
+  1ª palavra que **casa com o texto PT esperado** (match exato ou fuzzy ≥0.7
+  p/ palavras ≥4 chars).
+- **Corte no END da última palavra não-casada** (fim de palavra é timestamp
+  confiável; início sofre lag do whisper e come conteúdo).
+- **Guarda anti over-cut**: só corta se a palavra não-casada estiver separada
+  por silêncio (island RMS distinta) OU gap de palavra do whisper ≥0.12s —
+  cobre respiro/eco colado, mas NÃO come prefixo de palavra real transcrita
+  mal (ex. "É suposto"→"fosse" tem gap 0.0 → não corta).
+- Interjeições reais de 1 char do PT ("é", "a", "o", "ah") também casam →
+  preservadas.
+- Integrado nos dois paths do loop (≤220 e >220); heurística RMS antiga
+  (`_strip_leading_artifact`) vira fallback quando o ASR não corta.
+- Whisper carrega do snapshot local do HF (`~/.cache/.../faster-whisper-base`)
+  — robusto a rede instável; fallback gracioso para heurística se falhar.
+- Custo: ~1.25 s/fala (+~7 min em 341 falas ≈ +3% do TTS). Limpeza do tmp
+  file do path ≤220 (vazava) incluída.
+
+### Validação (produção + regenerações)
+- l9 (leak "É certo!"): **corta 3.55 s, remove o eco EN inteiro, PT íntegro**:
+  "Pense nisso, você fez o seu melhor irmão mais velho, deve ter sido difícil,
+  eu sei." ✓
+- l25 (artefato "Ed."): corta 0.31 s, "Ela" intacta ✓
+- l160/l289 (artefatos "Ai,"/"E,"): cortam 0.27/0.23 s, conteúdo íntegro ✓
+- l48 ("É suposto" transcrito "fosse"): **NÃO corta** (anti over-cut) ✓
+- Linhas limpas (00025, l60, l141): 0.00 s cortados ✓
+- Amostra aleatória 25 linhas: 4 cortadas, **0 over-cut** (1ª palavra PT
+  sempre presente no resultado) ✓
+- `./dub check` + `go build -o dub .` + `go vet ./...` + `py_compile` OK.
+- Próximo passo: rodar TTS parcial (`--force` num subset) para validar a
+  integração no fluxo real; depois commit+push e (opcional) re-dublagem
+  completa do ep01 para QA final.

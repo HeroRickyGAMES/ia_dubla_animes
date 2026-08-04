@@ -18,8 +18,10 @@ Uso:
         --work work --engine ~/projetos/aiuto_trend_producer
 """
 import argparse
+import difflib
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -134,6 +136,98 @@ def _strip_tail_junk(seg):
     return seg
 
 
+def _norm_word(w):
+    """Normaliza palavra p/ comparação (minúsculas, só letras/dígitos)."""
+    return re.sub(r"[^a-zà-ú0-9]", "", w.lower())
+
+
+def _strip_leading_artifact_asr(seg, pt_text, whisper):
+    """Strip guiado por ASR: remove conteúdo anterior à 1ª palavra que casa
+    com o texto PT esperado.
+
+    Resolve o artefato inicial ("at"/"Ed.") E o eco do ref_text (vazamento
+    EN), porque nenhum dos dois casa com o PT. Preserva a 1ª palavra real
+    (mesmo curta, ex. interjeição "É."/"Ah").
+
+    Corte no END da última palavra não-casada (fim de palavra é timestamp
+    confiável; início sofre lag do whisper e come conteúdo). Requer que a
+    palavra não-casada seja substancial (>=4 chars) OU que haja silêncio
+    real (>0.12s) entre ela e a 1ª palavra casada — assim nunca come o
+    prefixo de uma palavra real que o whisper transcreveu mal.
+    """
+    if not pt_text or not whisper or not seg:
+        return seg
+    pt_words = [_norm_word(w) for w in pt_text.split()]
+    pt_set = {w for w in pt_words if len(w) >= 2}
+    # interjeições/artigos de 1 char reais do PT ("é", "a", "o") também casam
+    pt_set |= {w for w in pt_words if len(w) == 1}
+    if not pt_set:
+        return seg
+    tmp_path = None
+    try:
+        tmp_path = _seg_to_path(seg)
+        segs, _ = whisper.transcribe(
+            tmp_path, language="pt", word_timestamps=True)
+        words = [(w.word, w.start, w.end) for s in segs for w in (s.words or [])]
+    except Exception:
+        return seg
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    if not words:
+        return seg
+    islands = _sound_islands(seg)
+
+    def _island_of(t):
+        for i, (a, b) in enumerate(islands):
+            if a - 0.02 <= t <= b + 0.02:
+                return i
+        return -1
+
+    for idx, (word, start, end) in enumerate(words):
+        nw = _norm_word(word)
+        if not nw:
+            continue
+        matched = nw in pt_set
+        if not matched and len(nw) >= 4:
+            best = max(
+                (difflib.SequenceMatcher(None, nw, pw).ratio() for pw in pt_set),
+                default=0.0)
+            matched = best >= 0.7
+        if not matched:
+            continue
+        if idx == 0:
+            return seg
+        pword, pstart, pend = words[idx - 1]
+        pi = _island_of(pstart)
+        mi = _island_of(start)
+        # Artefato separado por silêncio (island distinta) OU por fronteira
+        # de palavra do whisper (gap >= 0.12s — cobre respiro/eco colado que
+        # o RMS junta numa island só). O gap guarda contra comer prefixo de
+        # palavra real transcrita mal (ex. "É suposto" -> "fosse"): nesses
+        # casos o whisper mantém as palavras contíguas (gap ~0).
+        separated = (pi >= 0 and mi >= 0 and pi != mi) or (start - pend >= 0.12)
+        if separated:
+            cut_ms = int((pend + 0.03) * 1000)
+            total_ms = len(seg)
+            if 0 < cut_ms < total_ms * 0.6:
+                return seg[cut_ms:]
+        return seg
+    return seg
+
+
+def _seg_to_path(seg):
+    """Salva um AudioSegment em arquivo temporário e devolve o caminho."""
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    seg.export(tmp.name, format="wav")
+    tmp.close()
+    return tmp.name
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lines", required=True)
@@ -156,10 +250,28 @@ def main():
     import torch
     from pydub import AudioSegment
     from omnivoice import OmniVoice
+    from faster_whisper import WhisperModel
 
     os.makedirs(args.out, exist_ok=True)
     engine_ov = OmniVoiceNarrator({})           # helpers (pos-process)
     engine_xtts = TTSNarrator({"tts": {}})      # helpers (_strip_silence)
+
+    # ASR p/ strip guiado do artefato inicial + eco do ref_text (base, rápido).
+    # Carrega do snapshot local do HF primeiro: robusto a rede instável.
+    whisper = None
+    try:
+        import glob as _glob
+        snap = sorted(_glob.glob(os.path.expanduser(
+            "~/.cache/huggingface/hub/models--Systran--faster-whisper-base/"
+            "snapshots/*")))
+        if snap:
+            whisper = WhisperModel(snap[0], device="cpu", compute_type="int8")
+        else:
+            whisper = WhisperModel("base", device="cpu", compute_type="int8")
+        print("[tts] whisper base carregado (strip guiado por ASR)")
+    except Exception as e:
+        whisper = None
+        print(f"[tts] sem whisper base ({e}); strip heurístico")
 
     with open(args.lines, encoding="utf-8") as f:
         data = json.load(f)
@@ -222,6 +334,7 @@ def main():
         if not text:
             times[str(line_id)] = 0
             continue
+        clean_text = text
 
         # isocronia: a fala dublada deve caber na janela da fala original.
         # O OmniVoice aceita `duration` (s) e preenche exatamente esse tempo,
@@ -261,8 +374,13 @@ def main():
                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                         sf.write(tmp.name, arr, SAMPLE_RATE)
                         seg = AudioSegment.from_wav(tmp.name)
+                        os.unlink(tmp.name)
                     seg = engine_xtts._strip_silence(seg)
-                    seg = _strip_leading_artifact(seg)
+                    asr_stripped = _strip_leading_artifact_asr(seg, clean_text, whisper)
+                    if asr_stripped is seg:
+                        seg = _strip_leading_artifact(seg)
+                    else:
+                        seg = asr_stripped
                     seg = _strip_tail_junk(seg)
                     seg = seg.fade_in(8).fade_out(12)
                     final = seg
@@ -291,12 +409,16 @@ def main():
                         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                             sf.write(tmp.name, arr, SAMPLE_RATE)
                             seg = AudioSegment.from_wav(tmp.name)
+                            os.unlink(tmp.name)
                         seg = engine_xtts._strip_silence(seg)
-                        seg = _strip_leading_artifact(seg)
+                        asr_stripped = _strip_leading_artifact_asr(seg, sent, whisper)
+                        if asr_stripped is seg:
+                            seg = _strip_leading_artifact(seg)
+                        else:
+                            seg = asr_stripped
                         seg = _strip_tail_junk(seg)
                         seg = seg.fade_in(8).fade_out(12)
                         parts.append((sent, seg))
-                        os.unlink(tmp.name)
 
                     final = AudioSegment.empty()
                     for j, (sent, seg) in enumerate(parts):
