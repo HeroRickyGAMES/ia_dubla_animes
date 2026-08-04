@@ -32,8 +32,20 @@ SAMPLE_RATE = 24000
 # vão ≥ 0.25s até a próxima ilha. Removemos isso sem tocar na fala real.
 ARTIFACT_MAX_FIRST = 0.6   # 1ª ilha acima disso não é artefato
 ARTIFACT_MIN_GAP = 0.25    # vão mínimo antes da fala real
+ARTIFACT_SHORT_FIRST = 0.25  # 1ª ilha bem curta + vão ≥ SHORT_GAP também é artefato
+ARTIFACT_SHORT_GAP = 0.12
 TAIL_MAX_LAST = 0.5        # cauda "resmungada" menor que isso é removida
 TAIL_MIN_GAP = 0.4         # se vier depois de um silêncio desse tamanho
+
+# O artefato "u/at" do OmniVoice costuma vir COLADO na fala real (gap < 0.25s),
+# às vezes como um cluster de micro-ilhas. Regra adicional: mesclamos as ilhas
+# iniciais com vãos < CLUSTER_GAP enquanto cada ilha for curta (≤ CLUSTER_ISLAND);
+# se o cluster resultante for curto (≤ CLUSTER_MAX) e a próxima ilha for bem mais
+# longa (≥ CLUSTER_RATIO), é aquecimento do modelo e cortamos.
+ARTIFACT_CLUSTER_GAP = 0.06
+ARTIFACT_CLUSTER_ISLAND = 0.25
+ARTIFACT_CLUSTER_MAX = 0.35
+ARTIFACT_CLUSTER_RATIO = 2.5
 
 
 def _sound_islands(seg):
@@ -70,8 +82,37 @@ def _strip_leading_artifact(seg):
         return seg
     f0, f1 = iso[0]
     s0, _ = iso[1]
-    if (f1 - f0) <= ARTIFACT_MAX_FIRST and (s0 - f1) >= ARTIFACT_MIN_GAP:
+    first_len = f1 - f0
+    gap = s0 - f1
+    # caso clássico: 1ª ilha curta + vão claro até a fala real
+    if first_len <= ARTIFACT_MAX_FIRST and gap >= ARTIFACT_MIN_GAP:
         cut_ms = int((s0 - 0.03) * 1000)  # mantém 30ms de respiro
+        total_ms = len(seg)
+        if 0 < cut_ms < total_ms * 0.5:
+            return seg[cut_ms:]
+    # caso curto: 1ª ilha bem curta + vão pequeno (artefato quase colado)
+    if first_len <= ARTIFACT_SHORT_FIRST and gap >= ARTIFACT_SHORT_GAP:
+        cut_ms = int((s0 - 0.03) * 1000)
+        total_ms = len(seg)
+        if 0 < cut_ms < total_ms * 0.5:
+            return seg[cut_ms:]
+    # caso colado: mescla micro-ilhas iniciais; se o cluster for curto e a
+    # fala seguinte for bem mais longa, é aquecimento do modelo.
+    cluster_end = f1
+    for a, b in iso[1:]:
+        if a - cluster_end >= ARTIFACT_CLUSTER_GAP:
+            break
+        if b - a > ARTIFACT_CLUSTER_ISLAND:
+            break
+        cluster_end = b
+    cluster_len = cluster_end - f0
+    next_len = 0.0
+    for a, b in iso[1:]:
+        if a >= cluster_end:
+            next_len = b - a
+            break
+    if cluster_len <= ARTIFACT_CLUSTER_MAX and next_len >= cluster_len * ARTIFACT_CLUSTER_RATIO:
+        cut_ms = int((cluster_end + 0.03) * 1000)
         total_ms = len(seg)
         if 0 < cut_ms < total_ms * 0.5:
             return seg[cut_ms:]
@@ -101,8 +142,9 @@ def main():
     ap.add_argument("--engine", required=True,
                     help="pasta do aiuto_trend_producer (motor OmniVoice)")
     ap.add_argument("--max-lines", type=int, default=0, help="0 = todas")
-    ap.add_argument("--speed", type=float, default=1.0,
-                    help="fator de velocidade no OmniVoice (1.0 = natural)")
+    ap.add_argument("--speed", type=float, default=None,
+                    help="fator de velocidade no OmniVoice (1.0 = natural; "
+                         "default: isocronia via duration)")
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.join(args.engine, "modules"))
@@ -181,6 +223,12 @@ def main():
             times[str(line_id)] = 0
             continue
 
+        # isocronia: a fala dublada deve caber na janela da fala original.
+        # O OmniVoice aceita `duration` (s) e preenche exatamente esse tempo,
+        # distribuído entre as sentenças proporcionalmente ao texto.
+        win = (ln.get("end") or 0) - (ln.get("start") or 0)
+        target_dur = win * 0.95 if win > 0.3 else 0  # 95% deixa respiro
+
         t0 = time.time()
         out_path = os.path.join(args.out, f"{line_id:05d}.wav")
         last_err = None
@@ -190,10 +238,14 @@ def main():
                 if emo.get("emotion") in EMO_TAGS and emo.get("conf", 0) >= 0.4:
                     text = EMO_TAGS[emo["emotion"]] + text
                 sentences = engine_ov._dividir_em_sentencas(text)
+                total_len = sum(len(s) for s in sentences)
                 parts = []
-                for sent in sentences:
-                    kwargs = {"text": sent, "language": "pt",
-                              "speed": args.speed if args.speed and args.speed > 0 else None}
+                for j, sent in enumerate(sentences):
+                    kwargs = {"text": sent, "language": "pt"}
+                    if args.speed and args.speed > 0:
+                        kwargs["speed"] = args.speed
+                    elif target_dur > 0 and total_len > 0:
+                        kwargs["duration"] = target_dur * len(sent) / total_len
                     p = prompts.get(spk)
                     if p is not None:
                         kwargs["voice_clone_prompt"] = p

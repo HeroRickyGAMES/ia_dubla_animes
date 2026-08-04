@@ -234,3 +234,43 @@ para saber o que já foi feito e o que falta.
 - Saída: `YameiiS01E01.dub.mkv` (1.47 GB, 1440 s, h264 + aac 96 kHz,
   loudnorm -14 LUFS). Dados em docs/04-resultados.md.
 - Flags timeline: 233 long / 36 stretched / 103 clipped (ver timeline.go).
+
+## 2026-08-03 — Isocronia: TTS calibrado por fala (duration) + trim do artefato
+
+### Contexto
+- Usuário assistiu `YameiiS01E01.dub.mkv` no celular e reportou **assincronia**
+  (a voz dublada continua depois do lábio fechar).
+
+### Diagnóstico (análise acústica + timeline)
+- Causa raiz NÃO era só o artefato "at": a fala PT dublada é **~20–31% mais
+  longa que a janela original** (ratio: mediana 1.20–1.31, p75 1.62–1.77,
+  p90 2.14–2.40). Só ~26–50% dos dubs cabiam na janela.
+- O timeline estica no máx. 15% e depois **corta a cauda** (`clipped` = 103
+  falas) → a voz continua depois do lábio fechar. Janelas do ASR originais
+  estão corretas; o problema é o TTS PT ser mais longo que o original EN.
+- Artefato "at": análise de espectro mostrou 1ª ilha curta (mediana 0.19 s,
+  até 0.28 s), gap mediano 0.05 s (colado), centroid ~5 kHz (vs ~2 kHz da
+  fala real), RMS ratio ~1.0.
+
+### Fix (escolhido pelo usuário)
+- **2-pass TTS com calibração por fala** usando o parâmetro **`duration`** do
+  OmniVoice (sobrescreve `speed`; validado empiricamente: line 0 natural
+  6.38 s → duration=4.1 → 4.28 s; line 2 3.44 → 3.12 s).
+- Mesmo motor `k2-fsa/OmniVoice` (CPU), mesmos clones cacheados
+  (`work/refs/spk_*.pt`) — só muda o parâmetro de duração por fala.
+- `workers/tts.py`:
+  - Passa `duration = (end−start) * 0.95` ao `generate()`, distribuído entre
+    sentenças proporcionalmente ao texto (multi-sentença: 70/341 linhas,
+    média 1.26 sentenças).
+  - `--speed` agora default `None` (antes 1.0 fazia o `duration` nunca
+    ser usado — bug do branch).
+  - Trim do artefato melhorado: regra clássica (1ª ilha ≤0.6 s + gap ≥0.25 s)
+    + regra curta (≤0.25 s + gap ≥0.12 s) + **regra de cluster colado**
+    (micro-ilhas com vão <0.06 s, cluster ≤0.35 s e fala seguinte ≥2.5x).
+- Validação: 3 falas-teste caem de excesso +1.45/+2.79 s para −0.25/−0.30/−0.21 s
+  (cabem na janela). ASR confirma que o trim NÃO corta a 1ª palavra real.
+
+### Run de re-dublagem (em andamento)
+- Regerando 341 dubs com o novo tts.py (~5–6 h, ~50–70 s/fala com clone).
+- Depois: mix (timeline.go já OK; stretch/clip vira caso raro) + QA.
+- Est. ~6.6 h de TTS para 341 falas; validar isocronia no final e commit+push.
