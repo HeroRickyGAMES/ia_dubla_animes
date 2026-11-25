@@ -297,16 +297,24 @@ def main():
         "surprised": "[surprise-ah] ",
     }
 
+    import hashlib
     prompts = {}
     for spk, info in speakers.items():
         ref_audio = info.get("ref_audio")
         ref_text = info.get("ref_text", "").strip()
-        cache = os.path.join(args.work, "refs", spk + ".pt")
+        # O rótulo spk_N é só o índice do cluster (permutação arbitrária).
+        # Chavear o cache só por spk permitia reaproveitar tokens do
+        # personagem ERRADO após re-diarização. Inclui hash do refáudio.
+        rhash = ""
+        if ref_audio and os.path.exists(ref_audio):
+            with open(ref_audio, "rb") as rf:
+                rhash = "_" + hashlib.sha256(rf.read()).hexdigest()[:12]
+        cache = os.path.join(args.work, "refs", spk + rhash + ".pt")
         if ref_audio and os.path.exists(ref_audio):
             try:
                 if os.path.exists(cache):
                     from omnivoice import VoiceClonePrompt
-                    prompts[spk] = VoiceClonePrompt.load(cache)
+                    prompts[spk] = VoiceClonePrompt.load(cache, map_location="cpu")
                     print(f"[tts] {spk}: prompt de clone do cache")
                 else:
                     prompts[spk] = model.create_voice_clone_prompt(
@@ -335,6 +343,13 @@ def main():
             times[str(line_id)] = 0
             continue
         clean_text = text
+        # Tag de emoção é calculada UMA VEZ. Dentro do loop de retry, o texto
+        # era concatenado de novo a cada tentativa ("[laughter] [laughter]..."),
+        # gerando falas com múltiplos sons e duração fora da calibração.
+        emo = emotions.get(str(line_id), {})
+        tagged = text
+        if emo.get("emotion") in EMO_TAGS and emo.get("conf", 0) >= 0.4:
+            tagged = EMO_TAGS[emo["emotion"]] + text
 
         # isocronia: a fala dublada deve caber na janela da fala original.
         # O OmniVoice aceita `duration` (s) e preenche exatamente esse tempo,
@@ -347,9 +362,7 @@ def main():
         last_err = None
         for attempt in range(3):
             try:
-                emo = emotions.get(str(line_id), {})
-                if emo.get("emotion") in EMO_TAGS and emo.get("conf", 0) >= 0.4:
-                    text = EMO_TAGS[emo["emotion"]] + text
+                text = tagged
                 # Otimização: texts curtos (≤220 chars) geram numa chamada
                 # só — reutiliza o prefill do prompt de clone (~1.7x mais
                 # rápido para falas multi-sentença). Só split se >220 chars

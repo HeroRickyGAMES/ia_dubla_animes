@@ -372,3 +372,79 @@ para saber o que já foi feito e o que falta.
 - Próximo passo: rodar TTS parcial (`--force` num subset) para validar a
   integração no fluxo real; depois commit+push e (opcional) re-dublagem
   completa do ep01 para QA final.
+
+## 2026-11-25 — Auditoria do ambiente, análise dos vídeos e correções
+
+### Ambiente
+- `.venv` não existia (tinha sumido); recriado com Python 3.12.3 e
+  `requirements.txt`. Instalados torch 2.15.0+cpu, torchaudio 2.11.1+cpu,
+  faster-whisper 1.2.1, omnivoice 0.2.1, demucs 4.1.0, librosa 1.0.1,
+  speechbrain 1.1.2, scikit-learn 1.9.1, scipy 1.18.1, numpy 2.5.5.
+- `go build -o dub .`, `go vet ./...` e `./dub check` OK.
+- **Bug de versão corrigido**: faster-whisper 1.2.1 chama
+  `av.open(..., metadata_errors="ignore")`, removido no `av` 19 (instalado
+  pelo pip). Fix: `av>=14,<19` em `requirements.txt` (16.1.0 instalado).
+  Sem isso, QUALQUER transcrição quebrava (`TypeError`).
+
+### Análise dos vídeos (YameiiS01E01.mkv × YameiiS01E01.dub.mkv)
+- Original: 1440.1 s, h264 1080p 23.976 fps, aac 44.1 kHz stereo + legenda
+  ASS (só letreiros "SIGN", sem diálogo) + 9 anexos.
+- Dub: 1440.075 s, h264 1080p (stream de vídeo copiado), aac 96 kHz stereo.
+  Áudio: -19.2 dB médio vs -30.1 dB do original (loudnorm -14 LUFS), pico
+  -1.0 dB (original -4.2 dB) — menos headroom.
+- ASR (faster-whisper small, int8) transcreveu 429 falas no original e 343
+  na dublagem. Análise por janela original:
+  - **Fim da fala dublada estoura a janela do lábio**: mediana +0.47 s,
+    p90 +0.84 s, **171/429 falas com >0.5 s de atraso** (ex.: +1.13 s em
+    "As long as you plan on paying me back"). É a assincronia relatada.
+  - Início: mediana +0.05 s (bom), p90 +0.58 s; 41 falas começam >0.5 s
+    atrasadas.
+  - 36 janelas originais não têm palavra PT detectada na dublagem (parte
+    pode ser split fino do ASR, parte fala realmente perdida).
+  - Detector acústico: 52 ilhas iniciais suspeitas (artefato "at"/eco),
+    24 caudas isoladas, 10 trechos com nível baixo (todos entre 1255–1278 s,
+    mesma cena), 0 clipping.
+  - Varredura de palavras EN na transcrição PT: **0 vazamentos detectados**
+    na amostra (o vazamento é estocástico; pode existir em falas curtas).
+
+### Bugs corrigidos nesta sessão
+11. `internal/timeline/timeline.go` — **causa raiz da assincronia**: o limite
+    de duração só era calculado contra a PRÓXIMA fala. Com silêncio depois,
+    a dublagem podia continuar 0.3–1 s após o lábio fechar. Agora
+    `limit = min(end + windowTol, nextStart - minGap + overlap)`, com
+    overlap menor (0.15 s) quando o personagem seguinte é diferente.
+12. `internal/pipeline/run.go` — seleção de ref de voz usava `prob` direto
+    (avg_logprob é NEGATIVO), priorizando falas CURTAS e duvidosas. Passou a
+    `exp(prob) × duração` e mínimo de 1.0 s.
+13. `workers/tts.py` — tag de emoção era concatenada de novo em cada retry
+    (`[laughter] [laughter]...`); agora calculada uma vez fora do loop.
+14. `workers/tts.py` — cache do prompt de clone era `spk_N.pt` (índice de
+    cluster arbitrário) e podia reaproveitar a voz do personagem errado após
+    re-diarização. Agora o nome inclui hash SHA256 do refáudio e o load usa
+    `map_location="cpu"`.
+15. `internal/translate/translate.go` — status 429/5xx não era retentado
+    (`err == nil` com status 429 quebrava o loop) e o mesmo `req` era reusado.
+    Agora 3 tentativas com request novo e backoff.
+16. `internal/pipeline/run.go` — texto devolvido IDÊNTICO ao original
+    (tradução falsa com status 200) passava batido. Agora falas >12 chars
+    são retentadas individualmente.
+17. `internal/pipeline/run.go` — cache de `tts_times.json` era aceito sem
+    conferir se os WAVs existem (run com `--max-lines 20` seguido de run
+    completo quebrava o mix). Novo `checkDubs()` valida arquivo + duração.
+18. `internal/pipeline/run.go` — segmentos descartados por `no_speech > 0.9`
+    perdiam a voz original (fundo vem de `nv.wav`) sem log. Agora são
+    contabilizados e avisados.
+19. `workers/diar.py` — se ECAPA falhasse em um segmento tardio, os
+    embeddings anteriores eram apagados e as falas viravam `spk_0`. Agora
+    refaz TODOS os segmentos com MFCC.
+20. `internal/pipeline/pipeline.go` — cache validado só por existência do
+    arquivo. Novo `.run_signature` (hash de entrada + flags) invalida os
+    estágios derivados quando mudam `--lang`, `--model`, `--max-lines`,
+    vídeo etc. Separação demucs só é refeita se a entrada mudar.
+
+### Estado
+- Modelos: faster-whisper small em cache; OmniVoice (2.4 GB) sendo baixado
+  novamente (1ª tentativa travou no xet; reiniciado com
+  `HF_HUB_DISABLE_XET=1`).
+- Próximo: validar efeito de `ref_text` vazio no prompt de clone (eco EN),
+  re-dublagem completa com o código corrigido e QA final.

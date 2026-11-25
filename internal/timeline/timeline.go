@@ -15,16 +15,16 @@ import (
 
 // Line é uma fala pronta para mixagem.
 type Line struct {
-	ID        int
-	Start     float64 // janela da fala original
-	End       float64
-	Speaker   string
-	DubFile   string
-	DubLen    float64 // duração natural da fala dublada
-	Place     float64 // onde começa no mix (s)
-	Atempo    float64 // 1.0 = natural; >1 = acelerada (só com stretch-max)
-	PlayLen   float64 // duração efetiva no mix (pós atempo/atrim)
-	Flags     []string
+	ID      int
+	Start   float64 // janela da fala original
+	End     float64
+	Speaker string
+	DubFile string
+	DubLen  float64 // duração natural da fala dublada
+	Place   float64 // onde começa no mix (s)
+	Atempo  float64 // 1.0 = natural; >1 = acelerada (só com stretch-max)
+	PlayLen float64 // duração efetiva no mix (pós atempo/atrim)
+	Flags   []string
 }
 
 const (
@@ -61,12 +61,19 @@ func Plan(lines []Line, stretchMax float64) []Line {
 			l.Flags = append(l.Flags, "long")
 		}
 
-		// limite: não passar da fala seguinte (tolerância de overlap natural)
+		// Limite: não passar do FIM DA JANELA ORIGINAL (lip sync) nem da
+		// fala seguinte. Antes só era usada a fala seguinte: se houvesse
+		// silêncio longo depois, a voz dublada continuava depois do lábio
+		// fechar — a assincronia reportada pelo usuário.
 		nextStart := math.Inf(1)
+		overlap := overlapTol
 		if i+1 < len(ls) {
 			nextStart = ls[i+1].Start
+			if ls[i+1].Speaker != l.Speaker {
+				overlap = 0.15 // personagens diferentes não devem "conversar" em cima
+			}
 		}
-		limit := nextStart - minGap + overlapTol
+		limit := math.Min(l.End+windowTol, nextStart-minGap+overlap)
 		if place+eff > limit {
 			room := limit - place
 			switch {

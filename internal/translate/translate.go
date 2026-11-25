@@ -18,17 +18,17 @@ const endpoint = "https://translate.googleapis.com/translate_a/single"
 
 // Client traduz em lotes paralelos.
 type Client struct {
-	HTTP   *http.Client
-	Workers int
-	Delay  time.Duration // pausa entre lotes (respeito ao endpoint gratuito)
+	HTTP     *http.Client
+	Workers  int
+	Delay    time.Duration // pausa entre lotes (respeito ao endpoint gratuito)
 	MaxBatch int
 }
 
 func New() *Client {
 	return &Client{
-		HTTP:    &http.Client{Timeout: 20 * time.Second},
-		Workers: 6,
-		Delay:   150 * time.Millisecond,
+		HTTP:     &http.Client{Timeout: 20 * time.Second},
+		Workers:  6,
+		Delay:    150 * time.Millisecond,
 		MaxBatch: 24,
 	}
 }
@@ -128,7 +128,13 @@ func (c *Client) translateBatch(ctx context.Context, from, to string, texts []st
 	return res, nil
 }
 
-// translateOne traduz um único texto.
+// TranslateOne traduz um único texto (usado para retentar falas suspeitas).
+func (c *Client) TranslateOne(ctx context.Context, from, to, text string) (string, error) {
+	return c.translateOne(ctx, from, to, text)
+}
+
+// translateOne traduz um único texto, com retry em erros de transporte E em
+// respostas 429/5xx do endpoint gratuito (antes, 429 com err==nil não retentava).
 func (c *Client) translateOne(ctx context.Context, from, to, text string) (string, error) {
 	q := url.Values{}
 	q.Set("client", "gtx")
@@ -138,22 +144,34 @@ func (c *Client) translateOne(ctx context.Context, from, to, text string) (strin
 	q.Set("q", text)
 	u := endpoint + "?" + q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64)")
-
 	var resp *http.Response
-	for attempt := 0; ; attempt++ {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		// request nova a cada tentativa (reutilizar o mesmo req em GET funciona,
+		// mas é fragil se o corpo for alterado no futuro)
+		req, e := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if e != nil {
+			return "", e
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64)")
 		resp, err = c.HTTP.Do(req)
-		if err == nil || attempt >= 2 {
+		if err == nil && resp.StatusCode != 429 && resp.StatusCode < 500 {
 			break
 		}
-		time.Sleep(time.Duration(attempt+1) * 700 * time.Millisecond)
+		if resp != nil {
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+			resp.Body.Close()
+			resp = nil
+		}
+		if attempt < 2 {
+			time.Sleep(time.Duration(attempt+1) * 700 * time.Millisecond)
+		}
 	}
 	if err != nil {
 		return "", err
+	}
+	if resp == nil {
+		return "", fmt.Errorf("sem resposta do endpoint após 3 tentativas")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {

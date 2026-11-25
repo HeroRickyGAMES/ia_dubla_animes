@@ -87,10 +87,21 @@ def main():
             try:
                 e = embed_ecapa(slice_seg(s))
             except Exception as exc:
-                print(f"[diar] ECAPA falhou em runtime ({exc}); usando MFCC")
+                # ECAPA pode quebrar em runtime (ex.: F.pad 4D com torch
+                # recente). Reiniciar TODOS os segmentos com MFCC: antes,
+                # os embeddings já coletados eram descartados e os IDs
+                # anteriores ficavam sem cluster → spk_0 para todos.
+                print(f"[diar] ECAPA falhou em runtime ({exc}); "
+                      "refazendo todos os segmentos com MFCC")
                 use_ecapa = False
                 method = "mfcc"
                 vecs, ids = [], []
+                for s2 in segs:
+                    e2 = embed_mfcc(slice_seg(s2))
+                    if e2 is not None:
+                        vecs.append(e2)
+                        ids.append(s2["id"])
+                break
         if not use_ecapa:
             e = embed_mfcc(slice_seg(s))
         if e is None:

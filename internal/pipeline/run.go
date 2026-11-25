@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,6 +27,7 @@ func (o *Options) Run(ctx context.Context) error {
 	os.MkdirAll(filepath.Join(o.Work, "dubs"), 0o755)
 	os.MkdirAll(filepath.Join(o.Work, "refs"), 0o755)
 	os.MkdirAll(filepath.Dir(o.Out), 0o755)
+	o.checkCacheSignature()
 
 	if _, err := ffmpeg.Bin("ffmpeg"); err != nil {
 		return err
@@ -357,10 +359,13 @@ func (o *Options) stageSpeakers(ctx context.Context, vocalsRaw string, useSep bo
 		label := "spk_" + strconv.Itoa(c)
 		sp := &Speaker{Cluster: c, Label: label}
 
-		// seleciona trechos de voz para referência (6-9s, prioridade por prob×len)
+		// seleciona trechos de voz para referência (6-9s, prioridade por prob×len).
+		// avg_logprob do Whisper é NEGATIVO: usar o valor direto dava peso
+		// maior aos segmentos curtos e de baixa confiança. exp(prob) ∈ (0,1]
+		// pontua corretamente os trechos limpos e longos.
 		sort.SliceStable(segs, func(i, j int) bool {
-			wi := (segs[i].Prob) * (segs[i].End - segs[i].Start)
-			wj := (segs[j].Prob) * (segs[j].End - segs[j].Start)
+			wi := math.Exp(segs[i].Prob) * (segs[i].End - segs[i].Start)
+			wj := math.Exp(segs[j].Prob) * (segs[j].End - segs[j].Start)
 			return wi > wj
 		})
 		var parts []string
@@ -373,7 +378,7 @@ func (o *Options) stageSpeakers(ctx context.Context, vocalsRaw string, useSep bo
 			if len(parts) >= 6 {
 				break
 			}
-			if s.End-s.Start < 0.4 {
+			if s.End-s.Start < 1.0 {
 				continue
 			}
 			p := filepath.Join(o.Work, "refs", fmt.Sprintf("%s_%03d.wav", label, len(parts)))
@@ -500,15 +505,23 @@ func (o *Options) stageTranslate(ctx context.Context, spkMap map[string]*Speaker
 		return nil, err
 	}
 
-	// filtra falas com voz
+	// filtra falas com voz. Segmentos descartados perdem a voz original
+	// (o fundo vem de nv.wav, sem voz) — registrar para não sumir silenciosamente.
 	var sel []Segment
 	idxOf := map[int]int{}
+	var dropped []int
 	for _, s := range asr.Segments {
 		if s.NoSpeech > 0.9 || strings.TrimSpace(s.Text) == "" {
+			dropped = append(dropped, s.ID)
 			continue
 		}
 		idxOf[s.ID] = len(sel)
 		sel = append(sel, s)
+	}
+	if len(dropped) > 0 {
+		o.logf("[translate] %d segmento(s) sem voz detectada descartados (ids %v): "+
+			"a voz original NÃO estará no fundo — use --script/ASR mais sensível se houver fala perdida",
+			len(dropped), dropped)
 	}
 	o.logf("[translate] %d falas %s→pt...", len(sel), o.Lang)
 	o.TotalLines = len(sel)
@@ -534,6 +547,25 @@ func (o *Options) stageTranslate(ctx context.Context, spkMap map[string]*Speaker
 	}
 	if nmiss > 0 {
 		o.logf("[translate] %d/%d falas falharam (%v) — mantidas no original", nmiss, len(texts), err)
+	}
+	// Texto devolvido IDÊNTICO ao original (status 200 mas não traduzido) é
+	// falha silenciosa comum no endpoint gratuito. Refaz só essas falas.
+	if o.Lang != "pt" {
+		var retryIdx []int
+		for i, t := range texts {
+			if len(strings.TrimSpace(t)) >= 12 &&
+				strings.EqualFold(strings.TrimSpace(pts[i]), strings.TrimSpace(t)) {
+				retryIdx = append(retryIdx, i)
+			}
+		}
+		if len(retryIdx) > 0 {
+			for _, i := range retryIdx {
+				if v, e2 := tr.TranslateOne(ctx, o.Lang, "pt", texts[i]); e2 == nil && v != "" {
+					pts[i] = v
+				}
+			}
+			o.logf("[translate] %d falas devolvidas no original foram retentadas", len(retryIdx))
+		}
 	}
 
 	var lines []Line
@@ -618,12 +650,12 @@ func (o *Options) stageTTS(lines []Line, spkMap map[string]*Speaker) error {
 		}
 	}
 	if cached(filepath.Join(o.Work, "tts_times.json"), o.Force) {
-		// todas as falas já foram geradas
-		for i := range lines {
-			lines[i].DubFile = filepath.Join(o.Work, "dubs", fmt.Sprintf("%05d.wav", lines[i].ID))
-			if d, err := ffmpeg.DurWav(lines[i].DubFile); err == nil {
-				lines[i].DubLen = d
-			}
+		// Cache só é válido se TODAS as falas esperadas existem e têm duração.
+		// Antes, um run com --max-lines N seguido de um run completo reutilizava
+		// o tts_times.json e deixava DubFile apontando para WAVs inexistentes
+		// (mix quebrado / falas silenciosas).
+		if err := o.checkDubs(lines); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -647,11 +679,24 @@ func (o *Options) stageTTS(lines []Line, spkMap map[string]*Speaker) error {
 		return fmt.Errorf("tts: %d fala(s) falharam — log: %s",
 			tt.NErr, filepath.Join(o.Work, "tts_errors.log"))
 	}
+	return o.checkDubs(lines)
+}
+
+// checkDubs valida que cada fala tem um WAV dublado válido e preenche DubLen.
+func (o *Options) checkDubs(lines []Line) error {
 	for i := range lines {
-		lines[i].DubFile = filepath.Join(o.Work, "dubs", fmt.Sprintf("%05d.wav", lines[i].ID))
-		if d, err := ffmpeg.DurWav(lines[i].DubFile); err == nil {
-			lines[i].DubLen = d
+		p := filepath.Join(o.Work, "dubs", fmt.Sprintf("%05d.wav", lines[i].ID))
+		if _, err := os.Stat(p); err != nil {
+			return fmt.Errorf("fala %d sem WAV dublado (%s) — rode com --force",
+				lines[i].ID, p)
 		}
+		d, err := ffmpeg.DurWav(p)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("fala %d: duração inválida no WAV (%v) — rode com --force",
+				lines[i].ID, err)
+		}
+		lines[i].DubFile = p
+		lines[i].DubLen = d
 	}
 	return nil
 }

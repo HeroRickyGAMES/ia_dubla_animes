@@ -13,6 +13,9 @@ omnivoice
 
 # ── ASR (transcrição do japonês + timestamps de palavra) ─────────
 faster-whisper>=1.0
+# faster-whisper 1.2.1 usa av.open(..., metadata_errors="ignore");
+# av 19 removeu esse kwarg -> quebra a transcrição. Fixar <19.
+av>=14,<19
 
 # ── Separação voz × fundo (limpeza de fundo p/ fluxo melhor) ─────
 demucs>=1.0

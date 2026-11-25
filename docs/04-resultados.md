@@ -134,3 +134,34 @@ sem reduzir qualidade (CPU only, DDR4 2 canais).
 - **TTS CPU é memory-bound**: processos paralelos competem por bandwidth DDR4
   e ficam mais lentos. Só merge intra-linha (reuso de prefill) ajuda.
 
+## QA do `YameiiS01E01.dub.mkv` entregue (2026-11-25)
+
+Arquivo de 2026-08-03 (pré-isocronia / pré-strip por ASR). Comparação com
+`YameiiS01E01.mkv` por ASR (faster-whisper small, word timestamps):
+
+| Métrica | Valor | Interpretação |
+|---------|-------|---------------|
+| Falas transcritas | 429 (orig) / 343 (dub) | dub agrupa splits do orig |
+| Fim da fala − fim da janela | mediana **+0.47 s**, p90 **+0.84 s** | voz continua após o lábio fechar |
+| Falas com >0.5 s de estouro | **171/429 (40%)** | assincronia generalizada |
+| Início − início da janela | mediana +0.05 s, p90 +0.58 s | início quase sempre OK |
+| Janelas sem palavra PT | 36 | falas perdidas/splits finos |
+| Ilhas iniciais suspeitas | 52 | artefato "at"/"pet" (ASR ouviu "pet" em ~35/85 amostras) |
+| Caudas isoladas | 24 | resmungo final do modelo |
+| Trechos com nível baixo | 10 (todos em 1255–1278 s) | mesma cena, provável ducking excessivo |
+| Clipping | 0 | teto -1.0 dB (sem headroom, mas sem clip) |
+| Texto divergente (amostra 85) | 15 (18%) | 5 vazios + 10 parciais/deslocados |
+| Nível médio | -19.2 dB (dub) vs -30.1 dB (orig) | loudnorm -14 LUFS |
+
+Experimento controlado com OmniVoice (2026-11-25):
+- prompt com `ref_text` EN completo → **eco do inglês** na saída PT
+  ("Despite that, people get swept up in love. Olá, como você está?...");
+  similaridade de voz com a referência (ECAPA) = **0.691**.
+- prompt com `ref_text=""` → PT limpo, mas voz destruida (ECAPA **0.176**)
+  — confirmando que esvaziar o texto NÃO é solução.
+- `_strip_leading_artifact_asr` removendo 1.79 s de eco → PT íntegro e
+  mesmo conteúdo. O strip do commit 0a3f2c8 está correto; o problema
+  remanescente é só isocronia (corrigida em `timeline.go`).
+
+Re-dublagem com as correções em andamento em `YameiiS01E01.dub.fixed.mkv`.
+

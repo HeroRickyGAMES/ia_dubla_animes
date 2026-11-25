@@ -5,6 +5,8 @@
 package pipeline
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -103,40 +105,40 @@ type ASR struct {
 }
 
 type Diar struct {
-	Method     string         `json:"method"`
-	NClusters  int            `json:"n_clusters"`
-	Silhouette float64        `json:"silhouette"`
-	Assign     map[int]int    `json:"assign"`
+	Method     string      `json:"method"`
+	NClusters  int         `json:"n_clusters"`
+	Silhouette float64     `json:"silhouette"`
+	Assign     map[int]int `json:"assign"`
 }
 
 type Speaker struct {
-	Cluster   int
-	Label     string
-	RefAudio  string
-	RefText   string
-	SegIDs    []int
-	Profile   *voice.Profile
-	Character string
-	Expected  voice.Role
-	Conflict  bool
+	Cluster     int
+	Label       string
+	RefAudio    string
+	RefText     string
+	SegIDs      []int
+	Profile     *voice.Profile
+	Character   string
+	Expected    voice.Role
+	Conflict    bool
 	ConflictMsg string
 }
 
 type Line struct {
-	ID      int     `json:"id"`
-	Start   float64 `json:"start"`
-	End     float64 `json:"end"`
-	JA      string  `json:"ja"`
-	PT      string  `json:"pt"`
-	Speaker string  `json:"speaker"`
-	Gender  string  `json:"gender"`
-	Age     string  `json:"age"`
-	Role    string  `json:"role"`
-	DubFile string  `json:"-"`
-	DubLen  float64 `json:"-"`
-	Place   float64 `json:"-"`
-	Atempo  float64 `json:"-"`
-	PlayLen float64 `json:"-"`
+	ID      int      `json:"id"`
+	Start   float64  `json:"start"`
+	End     float64  `json:"end"`
+	JA      string   `json:"ja"`
+	PT      string   `json:"pt"`
+	Speaker string   `json:"speaker"`
+	Gender  string   `json:"gender"`
+	Age     string   `json:"age"`
+	Role    string   `json:"role"`
+	DubFile string   `json:"-"`
+	DubLen  float64  `json:"-"`
+	Place   float64  `json:"-"`
+	Atempo  float64  `json:"-"`
+	PlayLen float64  `json:"-"`
 	Flags   []string `json:"-"`
 }
 
@@ -179,6 +181,77 @@ func cached(path string, force bool) bool {
 	}
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// runSignature identifica COM QUÊ os arquivos em work/ foram gerados.
+// O cache antigo era validado só pela existência do arquivo: trocar --lang,
+// --model, --max-lines ou o vídeo de entrada reaproveitava dados errados
+// (ex.: asr.json em japonês gerado com --lang ja sendo usado com --lang en).
+type runSignature struct {
+	Input string `json:"input"`
+	Run   string `json:"run"`
+}
+
+func hashStr(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])[:16]
+}
+
+func (o *Options) signatures() runSignature {
+	in := o.Input
+	if st, err := os.Stat(o.Input); err == nil {
+		if abs, e := filepath.Abs(o.Input); e == nil {
+			in = abs
+		}
+		in = fmt.Sprintf("%s|%d|%d", in, st.Size(), st.ModTime().UnixNano())
+	}
+	return runSignature{
+		Input: hashStr(in + "|sep=" + o.Separator),
+		Run: hashStr(fmt.Sprintf(
+			"lang=%s|model=%s|sep=%s|overlap=%v|fastasr=%v|script=%s|roles=%s|"+
+				"maxlines=%d|speed=%.3f|stretch=%.3f|engine=%s",
+			o.Lang, o.Whisper, o.Separator, o.Overlap, o.FastASR,
+			o.Script, o.Roles, o.MaxLines, o.TtsSpeed, o.StretchMax, o.Engine)),
+	}
+}
+
+// checkCacheSignature invalida estágios derivados quando as flags ou a
+// entrada mudam. A separação (demucs, caro) só é descartada se o vídeo
+// mudou; ASR/overlap/diar/tradução/TTS são sempre descartados.
+func (o *Options) checkCacheSignature() {
+	sigPath := filepath.Join(o.Work, ".run_signature")
+	now := o.signatures()
+	var old runSignature
+	if b, err := os.ReadFile(sigPath); err == nil {
+		_ = json.Unmarshal(b, &old)
+	}
+	if o.Force || (old == runSignature{}) {
+		_ = writeJSON(sigPath, now)
+		return
+	}
+	if old == now {
+		return
+	}
+	o.logf("[cache] assinatura mudou — invalidando estágios derivados")
+	// derivados baratos/médios: sempre recalcados
+	derived := []string{
+		"asr.json", "overlap.json", "diar.json", "profile.json",
+		"lines.json", "emotion.json", "tts_times.json", "tts_errors.log",
+	}
+	for _, name := range derived {
+		_ = os.Remove(filepath.Join(o.Work, name))
+	}
+	_ = os.RemoveAll(filepath.Join(o.Work, "dubs"))
+	_ = os.RemoveAll(filepath.Join(o.Work, "refs"))
+	_ = os.MkdirAll(filepath.Join(o.Work, "dubs"), 0o755)
+	_ = os.MkdirAll(filepath.Join(o.Work, "refs"), 0o755)
+	// separação depende só da entrada + modo
+	if old.Input != now.Input {
+		for _, name := range []string{"vocals.wav", "nv.wav", "audio16k.wav", "audio48k.wav"} {
+			_ = os.Remove(filepath.Join(o.Work, name))
+		}
+	}
+	_ = writeJSON(sigPath, now)
 }
 
 func readJSON[T any](path string) (*T, error) {
