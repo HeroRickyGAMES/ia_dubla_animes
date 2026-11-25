@@ -236,6 +236,8 @@ def main():
     ap.add_argument("--engine", required=True,
                     help="pasta do aiuto_trend_producer (motor OmniVoice)")
     ap.add_argument("--max-lines", type=int, default=0, help="0 = todas")
+    ap.add_argument("--resume", action="store_true",
+                    help="pula falas que já têm WAV válido (retomada após interrupção)")
     ap.add_argument("--speed", type=float, default=None,
                     help="fator de velocidade no OmniVoice (1.0 = natural; "
                          "default: isocronia via duration)")
@@ -332,13 +334,29 @@ def main():
             print(f"[tts] {spk}: SEM referência — voz padrão")
             prompts[spk] = None
 
+    def _wav_valido(path):
+        """WAV de fala já gerado e íntegro (não foi cortado no meio da escrita)."""
+        try:
+            import soundfile as _sf
+            info = _sf.info(path)
+            return info.frames >= 2400 and info.samplerate == SAMPLE_RATE
+        except Exception:
+            return False
+
     times = {}
     t_start = time.time()
-    n_ok = n_err = 0
+    n_ok = n_err = n_resumed = 0
     for i, ln in enumerate(lines):
         line_id = ln["id"]
         spk = ln.get("speaker", "")
         text = (ln.get("pt") or "").strip()
+        out_path = os.path.join(args.out, f"{line_id:05d}.wav")
+        if args.resume and _wav_valido(out_path):
+            # Retomada: esta fala já foi dublada antes da interrupção.
+            times[str(line_id)] = 0
+            n_ok += 1
+            n_resumed += 1
+            continue
         if not text:
             times[str(line_id)] = 0
             continue
@@ -358,7 +376,6 @@ def main():
         target_dur = win * 0.95 if win > 0.3 else 0  # 95% deixa respiro
 
         t0 = time.time()
-        out_path = os.path.join(args.out, f"{line_id:05d}.wav")
         last_err = None
         for attempt in range(3):
             try:
@@ -465,7 +482,7 @@ def main():
         json.dump({"total_ms": int(total * 1000), "per_line_ms": times,
                    "n_ok": n_ok, "n_err": n_err}, f)
     print(json.dumps({"n": len(lines), "ok": n_ok, "err": n_err,
-                      "total_seconds": total}))
+                      "resumed": n_resumed, "total_seconds": total}))
 
 
 if __name__ == "__main__":

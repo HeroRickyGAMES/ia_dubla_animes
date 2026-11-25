@@ -442,9 +442,20 @@ para saber o que já foi feito e o que falta.
     estágios derivados quando mudam `--lang`, `--model`, `--max-lines`,
     vídeo etc. Separação demucs só é refeita se a entrada mudar.
 
+21. `workers/tts.py` + `internal/pipeline/run.go` — **retomada por fala**.
+    Antes, se o TTS fosse interrompido, o `tts_times.json` (gravado só no
+    fim) não existia e um restart refazia as 335 falas do zero. Agora
+    `tts.py --resume` pula falas com WAV íntegro (valida sample rate e nº
+    de frames) e o Go passa `--resume` automaticamente quando encontra
+    `dubs/*.wav` sem `tts_times.json`. Teste: 2 WAVs prontos + 1 nova →
+    `{"n":3,"ok":3,"resumed":2}`.
+
 ### Estado
-- Modelos: faster-whisper small em cache; OmniVoice (2.4 GB) sendo baixado
-  novamente (1ª tentativa travou no xet; reiniciado com
-  `HF_HUB_DISABLE_XET=1`).
-- Próximo: validar efeito de `ref_text` vazio no prompt de clone (eco EN),
-  re-dublagem completa com o código corrigido e QA final.
+- Token HF configurado em `~/.cache/huggingface/token` (fora do repo) —
+  usuário HeroRickyGames. Não é obrigatório (modelos já em cache), mas
+  evita rate limits.
+- Todos os modelos em cache: OmniVoice 2,45 GB, whisper small/base,
+  HTDemucs, SepFormer, ECAPA (~3,8 GB no total).
+- Re-dublagem interrompida pelo usuário em **142/335 falas** (sem erros).
+  Ao rodar o mesmo comando novamente, o TTS retoma da fala 142 automaticamente.
+- Próximo: retomar re-dublagem e QA final comparativo.

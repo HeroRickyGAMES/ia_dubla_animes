@@ -668,6 +668,17 @@ func (o *Options) stageTTS(lines []Line, spkMap map[string]*Speaker) error {
 		"--engine", o.Engine,
 		"--max-lines", strconv.Itoa(o.MaxLines),
 	}
+	// Execução interrompida: dubs/ tem WAVs parciais e não há tts_times.json.
+	// Com --resume, as falas já geradas são puladas em vez de recomeçar do zero.
+	if entries, err := os.ReadDir(filepath.Join(o.Work, "dubs")); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".wav") {
+				o.logf("[tts] retomando: WAVs parciais encontrados, pulando falas já dubladas")
+				ttsArgs = append(ttsArgs, "--resume")
+				break
+			}
+		}
+	}
 	if o.TtsSpeed > 0 {
 		ttsArgs = append(ttsArgs, "--speed", strconv.FormatFloat(o.TtsSpeed, 'f', 3, 64))
 	}
